@@ -1,6 +1,7 @@
-psycopg2
-sentence-transformers
 fastapi
-pydantic
+uvicorn[standard]
+python-dotenv
+psycopg2-binary
+sentence-transformers
 google-generativeai
-uvicorn
+torch
