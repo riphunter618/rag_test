@@ -3,3 +3,4 @@ sentence-transformers
 fastapi
 pydantic
 google-generativeai
+uvicorn
