@@ -88,7 +88,7 @@ def generate_answer(query):
 
     sql = """
     SELECT text_chunk, book_name
-    FROM merged_table
+    FROM telugu_merged_table
     ORDER BY embedding <-> %s::vector
     LIMIT 5;
     """
@@ -175,3 +175,4 @@ def ask_question(request: QueryRequest):
 @app.get("/")
 def home():
     return {"message": "API is running"}
+
