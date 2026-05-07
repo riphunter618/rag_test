@@ -268,8 +268,8 @@ async def bulk_create_bookings(data: BulkBookingPayload):
 async def booking_approved_webhook(payload: dict):
     try:
         record = payload.get("record")
-
-        if not record:
+        return record
+        '''if not record:
             return {"status": "ignored"}
 
         if record.get("approval_status") != "approved":
@@ -295,7 +295,7 @@ async def booking_approved_webhook(payload: dict):
         return {
             "status": "success",
             "eventId": created_event.get("id")
-        }
+        }'''
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
