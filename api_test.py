@@ -1,61 +1,35 @@
-import warnings
-warnings.filterwarnings("ignore")
-
-import google.generativeai as genai
-import psycopg2
-from sentence_transformers import SentenceTransformer
 import os
-from dotenv import load_dotenv
-from fastapi import FastAPI
+import time
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.responses import RedirectResponse
+from pydantic import BaseModel, HttpUrl
+from typing import Optional, List
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from google.auth.transport.requests import Request
+import logging
+from supabase import create_client
 
-# -----------------------
-# LOAD ENV VARIABLES
-# -----------------------
-load_dotenv()
+SUPABASE_URL = "https://jchomjeizcpetzglspun.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpjaG9tamVpemNwZXR6Z2xzcHVuIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3ODA0OTk1NywiZXhwIjoyMDkzNjI1OTU3fQ.OXft5gHqECt1LK6_I81bb8Rzi5zQVwyQdsTLgWt7PRc"  # IMPORTANT: use service role key (server only)
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-if not GOOGLE_API_KEY:
-    raise ValueError("GOOGLE_API_KEY not found in .env file")
 
-if not DB_PASSWORD:
-    raise ValueError("DB_PASSWORD not found in .env file")
-
-# -----------------------
-# CONFIGURE GEMINI
-# -----------------------
-genai.configure(api_key=GOOGLE_API_KEY)
-
-llm = genai.GenerativeModel(
-    model_name="gemini-2.5-flash"
+# --------------------------------------------------
+# App Configuration
+# --------------------------------------------------
+app = FastAPI(
+    title="Tour Booking Calendar API",
+    description="Single + Bulk tour booking confirmations with Google Calendar invites.",
+    version="4.0.0"
 )
 
-# -----------------------
-# DATABASE CONFIG (NOW SAFE)
-# -----------------------
-DB_CONFIG = {
-    "host": "aws-1-ap-southeast-1.pooler.supabase.com",
-    "port": 6543,
-    "database": "postgres",
-    "user": "postgres.mvjutxwmwcfxvthzzvif",
-    "password": DB_PASSWORD,   # ← from .env now
-    "sslmode": "require"
-}
-
-# -----------------------
-# EMBEDDING MODEL
-# -----------------------
-EMBEDDING_MODEL = "BAAI/bge-base-en-v1.5"
-model = SentenceTransformer(EMBEDDING_MODEL)
-
-# -----------------------
-# FASTAPI INIT
-# -----------------------
-app = FastAPI()
-
+# --------------------------------------------------
+# Enable CORS
+# --------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -64,115 +38,264 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-class QueryRequest(BaseModel):
-    question: str
+# --------------------------------------------------
+# Google Calendar Setup
+# --------------------------------------------------
+SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
-class QueryResponse(BaseModel):
-    answer: str
+LOCAL_TOKEN_PATH = "token.json"
+LOCAL_CLIENT_SECRET_PATH = "client_secrets.json"
 
-# -----------------------
-# EMBEDDING FUNCTION
-# -----------------------
-def embed(text):
-    return model.encode(text).tolist()
+CLIENT_SECRET_PATH = (
+    "/etc/secrets/client_secrets.json"
+    if os.path.exists("/etc/secrets/client_secrets.json")
+    else LOCAL_CLIENT_SECRET_PATH
+)
 
-# -----------------------
-# RAG FUNCTION (UNCHANGED LOGIC)
-# -----------------------
-def generate_answer(query):
+TOKEN_PATH = (
+    "/etc/secrets/token.json"
+    if os.path.exists("/etc/secrets/token.json")
+    else LOCAL_TOKEN_PATH
+)
 
-    conn = psycopg2.connect(**DB_CONFIG)
-    cur = conn.cursor()
+print("Using CLIENT_SECRET_PATH:", CLIENT_SECRET_PATH)
+print("Using TOKEN_PATH:", TOKEN_PATH)
 
-    query_embedding = embed(query)
+# --------------------------------------------------
+# Google Auth
+# --------------------------------------------------
+def get_calendar_service():
+    creds = None
 
-    sql = """
-    SELECT text_chunk, book_name
-    FROM telugu_merged_table
-    ORDER BY embedding <-> %s::vector
-    LIMIT 5;
-    """
+    if os.path.exists(TOKEN_PATH):
+        creds = Credentials.from_authorized_user_file(TOKEN_PATH, SCOPES)
 
-    cur.execute(sql, (query_embedding,))
-    results = cur.fetchall()
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+            except Exception:
+                creds = None
 
-    cur.close()
-    conn.close()
+        if not creds:
+            if not os.path.exists(CLIENT_SECRET_PATH):
+                raise Exception("client_secrets.json not found")
 
-    context_blocks = []
-    book_names = set()
+            flow = InstalledAppFlow.from_client_secrets_file(
+                CLIENT_SECRET_PATH, SCOPES
+            )
+            creds = flow.run_local_server(
+                port=0,
+                access_type='offline',
+                prompt='consent'
+            )
+        try:
+            with open(TOKEN_PATH, "w") as token:
+                token.write(creds.to_json())
+        except OSError as e:
+            logging.warning(f'could not write token file, {e}')
 
-    for row in results:
-        text_chunk = row[0]
-        book_name = row[1]
-        book_names.add(book_name)
-        context_blocks.append(text_chunk)
+    return build("calendar", "v3", credentials=creds)
 
-    context = "\n\n".join(context_blocks)
-    book_list = ", ".join(book_names)
+# --------------------------------------------------
+# Models
+# --------------------------------------------------
+class CalendarEvent(BaseModel):
+    title: str
+    description: Optional[str] = None
+    startDateTime: str
+    endDateTime: str
 
-    full_prompt = f"""
-You are an academic textbook assistant.
 
-You are given:
-- A question from a student.
-- Retrieved context from a specific textbook.
-- The name of the textbook the context came from.
+class BookingPayload(BaseModel):
+    customerEmail: str
+    customerFirstName: str
+    customerLastName: str
+    customerPhone: Optional[str] = None
+    tourType: str
+    numberOfParticipants: int
+    bookingDate: str
+    bookingTime: str
+    isParticipantAdult: bool
+    hasAcceptedTerms: bool
+    digitalSignature: Optional[str] = None
+    paymentMethod: str
+    paymentStatus: str
+    tourPrice: float
+    calendarEvent: CalendarEvent
+    fulfillmentStatus: str
+    orderTimestamp: str
+    #terms_and_conditions:HttpUrl
+    #cancellation_policy:HttpUrl
+    #waiver_form:HttpUrl
+    #approval_status:str
 
-Your task:
 
-1. Carefully read the retrieved context.
-2. Extract the direct answer to the question strictly from the context.
-3. Rewrite the answer clearly in your own words.
-4. Provide additional background explanation using only the provided context.
-5. Do NOT add information that is not present in the context.
-6. If the answer is not clearly found, say:
-   "I don't know based on the textbook."
+class BulkBookingPayload(BaseModel):
+    bookings: List[BookingPayload]
 
-Response Format:
+# --------------------------------------------------
+# Root
+# --------------------------------------------------
+@app.get("/", include_in_schema=False)
+async def root_redirect():
+    return RedirectResponse(url="/docs")
 
-Answer:
-<clear answer in 3–5 sentences>
+# --------------------------------------------------
+# Helper Function
+# --------------------------------------------------
+def create_event(service, booking):
+    summary = f"{booking.calendarEvent.title} - {booking.tourType}"
 
-Background:
-<additional explanation>
+    description = f"""
+Booking Confirmation
 
-Source:
-{book_list}
+Customer: {booking.customerFirstName} {booking.customerLastName}
+Email: {booking.customerEmail}
+Phone: {booking.customerPhone or 'N/A'}
 
------------------------------------------
+Tour Type: {booking.tourType}
+Participants: {booking.numberOfParticipants}
+Adult: {'Yes' if booking.isParticipantAdult else 'No'}
 
-Context:
-{context}
+Booking Date: {booking.bookingDate}
+Time: {booking.bookingTime}
 
-Question:
-{query}
+Payment Method: {booking.paymentMethod}
+Payment Status: {booking.paymentStatus}
+Price: ₹{booking.tourPrice}
 
-Answer:
-"""
+Fulfillment Status: {booking.fulfillmentStatus}
+Order Timestamp: {booking.orderTimestamp}
 
-    response = llm.generate_content(
-        full_prompt,
-        generation_config={
-            "temperature": 0.2,
-            "max_output_tokens": 800,
+Terms Accepted: {'Yes' if booking.hasAcceptedTerms else 'No'}
+
+Terms and conditions: {booking.terms_and_conditions}
+cancellation policy: {booking.cancellation_policy}
+waiver form: {booking.waiver_form}
+Signature: {booking.digitalSignature or 'N/A'}
+    """.strip()
+
+    event_body = {
+        "summary": summary,
+        "description": description,
+
+        "start": {
+            "dateTime": booking.calendarEvent.startDateTime,
+            "timeZone": "Asia/Kolkata"
+        },
+
+        "end": {
+            "dateTime": booking.calendarEvent.endDateTime,
+            "timeZone": "Asia/Kolkata"
+        },
+
+        "attendees": [
+            {"email": booking.customerEmail}
+        ],
+
+        "status": "confirmed",
+
+        "guestsCanModify": False,
+        "guestsCanInviteOthers": False,
+        "guestsCanSeeOtherGuests": False,
+
+        "reminders": {
+            "useDefault": True
         }
-    )
+    }
 
-    return response.text
+    created_event = service.events().insert(
+        calendarId="primary",
+        body=event_body,
+        sendUpdates="all",
+        conferenceDataVersion=0
+    ).execute()
 
-# -----------------------
-# API ENDPOINT
-# -----------------------
-@app.post("/ask", response_model=QueryResponse)
-def ask_question(request: QueryRequest):
-    answer = generate_answer(request.question)
-    return {"answer": answer}
+    return created_event
 
-# -----------------------
-# HEALTH CHECK
-# -----------------------
-@app.get("/")
-def home():
-    return {"message": "API is running"}
+# --------------------------------------------------
+# Single Booking API
+# --------------------------------------------------
+@app.post("/create-booking-event")
+async def create_booking_event(booking: BookingPayload):
+    try:
+        data = booking.dict()
+        #returdata.pop('calendarEvent')
+        data["calendar_event"] = data.pop("calendarEvent")
+        data["approval_status"] = "pending"
+        response = supabase.table("bookings").insert(data).execute()
+        return {
+            "status": "pending",
+            "message": "Booking stored and waiting for admin approval",
+            "booking": response.data[0]
+        }
 
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --------------------------------------------------
+# Bulk Booking API
+# --------------------------------------------------
+@app.post("/bulk-create-bookings")
+async def bulk_create_bookings(data: BulkBookingPayload):
+    try:
+        service = get_calendar_service()
+        results = []
+
+        for booking in data.bookings:
+            created_event = create_event(service, booking)
+
+            results.append({
+                "customer": booking.customerFirstName,
+                "email": booking.customerEmail,
+                "eventId": created_event.get("id"),
+                "eventLink": created_event.get("htmlLink")
+            })
+
+            time.sleep(2)   # delay for better email delivery
+
+        return {
+            "status": "success",
+            "message": f"{len(results)} bookings created successfully.",
+            "results": results
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/webhook/booking-approved")
+async def booking_approved_webhook(payload: dict):
+    try:
+        record = payload.get("record")
+
+        if not record:
+            return {"status": "ignored"}
+
+        if record.get("approval_status") != "approved":
+            return {"status": "ignored"}
+
+        # Prevent duplicate processing
+        if record.get("event_created"):
+            return {"status": "already processed"}
+
+        # Convert to your model
+        record["calendarEvent"] = record.pop("calendar_event")
+        booking = BookingPayload(**record)
+
+        # Create event
+        service = get_calendar_service()
+        created_event = create_event(service, booking)
+
+        # Mark as processed
+        supabase.table("bookings").update({
+            "event_created": True
+        }).eq("id", record["id"]).execute()
+
+        return {
+            "status": "success",
+            "eventId": created_event.get("id")
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
