@@ -13,7 +13,7 @@ import logging
 from supabase import create_client
 
 SUPABASE_URL = "https://jchomjeizcpetzglspun.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpjaG9tamVpemNwZXR6Z2xzcHVuIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3ODA0OTk1NywiZXhwIjoyMDkzNjI1OTU3fQ.OXft5gHqECt1LK6_I81bb8Rzi5zQVwyQdsTLgWt7PRc"  # IMPORTANT: use service role key (server only)
+  # IMPORTANT: use service role key (server only)
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
