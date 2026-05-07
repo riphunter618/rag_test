@@ -1,7 +1,9 @@
 fastapi
-uvicorn[standard]
-python-dotenv
-psycopg2-binary
-sentence-transformers
-google-generativeai
-torch
+uvicorn
+google-api-python-client
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+packaging
+pydantic
+supabase
